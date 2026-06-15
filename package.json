@@ -1,0 +1,21 @@
+{
+  "name": "hive-typed-signer",
+  "version": "1.0.0",
+  "description": "Real ML-DSA-65 (NIST FIPS 204) typed-fragment signing and verification service. One post-quantum signature for an entire typed fragment set. Patent Pending HC-2026-001.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.5.0",
+    "@noble/post-quantum": "^0.6.1",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
