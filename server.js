@@ -28,17 +28,18 @@ import { SIGNER, verifyFn, PUBLIC_KEY_INFO } from './src/key.js';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*' }));
+// CORS: the cors package handles both simple requests and OPTIONS preflight.
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+};
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions)); // explicit preflight for all paths (Express 5 safe)
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   res.setHeader('X-Hive-Typed-Signer', SIGNER.version);
-  res.setHeader('Access-Control-Allow-Origin', '*');
   next();
-});
-app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
-  res.status(204).end();
 });
 
 const DEFAULT_SIGN_TYPES = ['reasoning', 'tool_call', 'final', 'decomposition'];
