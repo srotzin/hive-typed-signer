@@ -308,6 +308,9 @@ app.post('/sigr/bill', (req, res) => {
   try {
     const body = req.body || {};
     const reqObj = body.request || body;
+    if (!reqObj || reqObj.input_tokens === undefined || reqObj.output_tokens === undefined) {
+      return res.status(400).json({ error: 'Provide { request: { request_id, model_id, input_tokens, output_tokens, price_*_micro_usd, ... } }' });
+    }
     const { envelope, timing_us } = signBillReceipt(reqObj, SIGNER, { hashSuite: body.hash_suite });
     res.json({ ok: true, product: 'SiGR-Bill', patent_pending: 'HC-2026-004', envelope, timing_us });
   } catch (err) {
@@ -331,10 +334,17 @@ app.post('/sigr/bond', (req, res) => {
   try {
     const body = req.body || {};
     if (body.measurement) {
-      const envelope = signMeasurement(body.measurement, SIGNER, { hashSuite: body.hash_suite });
+      const m = body.measurement;
+      if (!m.bond_id || m.observed_latency_ms === undefined) {
+        return res.status(400).json({ error: 'Provide { measurement: { bond_id, request_id, observed_latency_ms, served, seq } }' });
+      }
+      const envelope = signMeasurement(m, SIGNER, { hashSuite: body.hash_suite });
       return res.json({ ok: true, product: 'SiGR-Bond', kind: 'measurement', patent_pending: 'HC-2026-005', envelope });
     }
     const terms = body.terms || body;
+    if (!terms || !terms.bond_id || terms.penalty_micro_usd === undefined) {
+      return res.status(400).json({ error: 'Provide { terms: { bond_id, customer_ref, latency_ceiling_ms, uptime_floor_ppm, penalty_micro_usd, ... } } or { measurement: {...} }' });
+    }
     const envelope = signBond(terms, SIGNER, { hashSuite: body.hash_suite });
     res.json({ ok: true, product: 'SiGR-Bond', kind: 'bond', patent_pending: 'HC-2026-005', envelope });
   } catch (err) {
@@ -345,7 +355,9 @@ app.post('/sigr/bond/verify', (req, res) => {
   try {
     const body = req.body || {};
     const envelope = body.envelope !== undefined ? body.envelope : body;
-    if (!envelope) return res.status(400).json({ error: 'Provide { envelope }' });
+    if (!envelope || (!envelope.measurement && !envelope.terms)) {
+      return res.status(400).json({ error: 'Provide { envelope } (a signed bond or measurement)' });
+    }
     const result = envelope.measurement
       ? verifyMeasurement(envelope, verifyFn, pubFromEnv(envelope))
       : verifyBond(envelope, verifyFn, pubFromEnv(envelope));
@@ -360,6 +372,9 @@ app.post('/sigr/chain', (req, res) => {
   try {
     const body = req.body || {};
     const run = body.run || body;
+    if (!run || !run.run_id || !Array.isArray(run.steps) || run.steps.length === 0) {
+      return res.status(400).json({ error: 'Provide { run: { run_id, agent_ref, steps: [{ step_id, kind, seq, parents, input, output }] } }' });
+    }
     const { envelope, timing_us } = signChain(run, SIGNER, { hashSuite: body.hash_suite });
     res.json({ ok: true, product: 'SiGR Chain', patent_pending: 'HC-2026-006', envelope, timing_us });
   } catch (err) {
@@ -370,7 +385,7 @@ app.post('/sigr/chain/verify', (req, res) => {
   try {
     const body = req.body || {};
     const envelope = body.envelope !== undefined ? body.envelope : body;
-    if (!envelope) return res.status(400).json({ error: 'Provide { envelope }' });
+    if (!envelope || !Array.isArray(envelope.steps)) return res.status(400).json({ error: 'Provide { envelope } (a signed chain run)' });
     const result = verifyChain(envelope, verifyFn, pubFromEnv(envelope));
     res.json({ product: 'SiGR Chain', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
@@ -386,6 +401,9 @@ app.post('/sigr/consensus', (req, res) => {
     const method = body.method || 'majority';
     // Sign each member sub-receipt first, then seal the panel over them.
     const members = Array.isArray(body.members) ? body.members : [];
+    if (members.length === 0) {
+      return res.status(400).json({ error: 'Provide { panel: { panel_id }, method, members: [{ panel_id, model_id, output_digest, score, seq }] }' });
+    }
     const subEnvs = members.map((m, i) => signSubReceipt(m, SIGNER, { hashSuite: body.hash_suite }));
     const { envelope, timing_us } = signConsensus(panel, subEnvs, method, SIGNER, { hashSuite: body.hash_suite });
     res.json({ ok: true, product: 'SiGR-Consensus', patent_pending: 'HC-2026-007', envelope, sub_receipts: subEnvs, timing_us });
@@ -398,7 +416,7 @@ app.post('/sigr/consensus/verify', (req, res) => {
     const body = req.body || {};
     const envelope = body.envelope !== undefined ? body.envelope : body;
     const subEnvs = Array.isArray(body.sub_receipts) ? body.sub_receipts : [];
-    if (!envelope) return res.status(400).json({ error: 'Provide { envelope, sub_receipts }' });
+    if (!envelope || !envelope.panel_id) return res.status(400).json({ error: 'Provide { envelope, sub_receipts }' });
     const result = verifyConsensus(envelope, subEnvs, verifyFn, pubFromEnv(envelope));
     res.json({ product: 'SiGR-Consensus', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
