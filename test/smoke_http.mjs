@@ -94,6 +94,39 @@ const SHA64 = (c) => c.repeat(64);
   const taBad = await post('/sigr/toolanchor', { call: { tool_id: 'web_now', input: {}, output: {}, deterministic: false, holder: 'a' } });
   rec('toolanchor rejects non-deterministic (400)', taBad.status === 400, `status=${taBad.status}`);
 
+  // 6) GCA sign + verify (per-claim grounding, one unsupported claim visible)
+  const gca = await post('/sigr/gca', { grounding_claims: {
+    answer_id: 'ans-1', method_hash: SHA64('e'),
+    claims: [
+      { claim_id: 1, claim: 'c1', support: SHA64('1'), support_strength: 0.96 },
+      { claim_id: 2, claim: 'c2', support: SHA64('2'), support_strength: 0.88 },
+      { claim_id: 3, claim: 'c3', support: null },
+    ],
+  } });
+  rec('gca sign 200+ok', gca.status === 200 && gca.body?.ok && (gca.body.envelope?.envelope_signature?.length||0) > 3000, `status=${gca.status} ok=${gca.body?.ok}`);
+  const gcaEnv = gca.body?.envelope;
+  rec('gca unsupported visible + asserts support_not_truth', gcaEnv?.unsupported_count === 1 && gcaEnv?.asserts === 'support_not_truth', `unsup=${gcaEnv?.unsupported_count} asserts=${gcaEnv?.asserts}`);
+  const gcav = await post('/sigr/gca/verify', { envelope: gcaEnv });
+  rec('gca verify valid', gcav.status === 200 && gcav.body?.valid === true, `valid=${gcav.body?.valid} reasons=${(gcav.body?.reasons||[]).join('|')}`);
+  // gca sign-gate: missing method_hash -> 400
+  const gcaBad = await post('/sigr/gca', { grounding_claims: { claims: [{ claim: 'x', support: null }] } });
+  rec('gca rejects missing method_hash (400)', gcaBad.status === 400, `status=${gcaBad.status}`);
+
+  // 7) GiTM sign + verify (cross-signal anomaly, asserts provenance_anomaly_only)
+  const gitm = await post('/sigr/gitm', { gitm: {
+    subject_id: 'ans-1', claims_root_ref: gcaEnv?.claims_root,
+    signals: { grounding_anomaly: 0.74, cross_run_divergence: 0.63 },
+  } });
+  rec('gitm sign 200+ok', gitm.status === 200 && gitm.body?.ok && (gitm.body.envelope?.envelope_signature?.length||0) > 3000, `status=${gitm.status} ok=${gitm.body?.ok}`);
+  const gitmEnv = gitm.body?.envelope;
+  rec('gitm triggered + asserts provenance_anomaly_only + triangulate', gitmEnv?.triggered === true && gitmEnv?.asserts === 'provenance_anomaly_only' && gitmEnv?.decision?.recommendation?.action === 'triangulate', `trig=${gitmEnv?.triggered} asserts=${gitmEnv?.asserts} action=${gitmEnv?.decision?.recommendation?.action}`);
+  const gitmv = await post('/sigr/gitm/verify', { envelope: gitmEnv });
+  rec('gitm verify valid', gitmv.status === 200 && gitmv.body?.valid === true, `valid=${gitmv.body?.valid} reasons=${(gitmv.body?.reasons||[]).join('|')}`);
+  // gitm asserts-tamper: flip the non-truth declaration -> verify fails
+  const gitmTamper = JSON.parse(JSON.stringify(gitmEnv)); gitmTamper.asserts = 'output_is_false';
+  const gitmtv = await post('/sigr/gitm/verify', { envelope: gitmTamper });
+  rec('gitm rejects tampered asserts', gitmtv.body?.valid === false, `valid=${gitmtv.body?.valid}`);
+
   const passed = results.filter(r => r.pass).length;
   const failed = results.length - passed;
   console.log(JSON.stringify({ passed, failed, total: results.length, results }, null, 2));

@@ -41,6 +41,8 @@ import { signAgenticRun, verifyAgenticRun } from './src/agentic.js';         // 
 import { signCern, verifyCern } from './src/cern.js';                        // HC-2026-010 (files first)
 import { signReward, verifyReward } from './src/reward.js';                  // HC-2026-011
 import { mintToolAnchor, verifyToolAnchor, resolveToolCall, verifyToolSavingsProof } from './src/toolreuse.js';
+import { signGca, verifyGca } from './src/gca.js';                            // GCA — per-claim grounding attestation
+import { signGitm, verifyGitm } from './src/gitm.js';                         // GiTM — cross-signal anomaly flag
 
 // item 1: signing-backend swap point. Software today; FPGA/ASIC drop-in later.
 // Selected via HIVE_SIGN_BACKEND (default SOFTWARE). The wrapped signer keeps
@@ -109,6 +111,10 @@ app.get('/', (req, res) => {
       'POST /sigr/chain/verify': 'Verify a SiGR Chain run (free)',
       'POST /sigr/consensus': 'SiGR-Consensus — signed multi-model panel',
       'POST /sigr/consensus/verify': 'Verify a SiGR-Consensus panel (free)',
+      'POST /sigr/gca': 'GCA — per-claim grounding attestation (proves support, not truth)',
+      'POST /sigr/gca/verify': 'Verify a GCA receipt (free)',
+      'POST /sigr/gitm': 'GiTM — cross-signal anomaly flag (asserts provenance anomaly only)',
+      'POST /sigr/gitm/verify': 'Verify a GiTM receipt (free)',
       'GET /health': 'Health check',
     },
     products: {
@@ -539,6 +545,64 @@ app.post('/sigr/reward/verify', (req, res) => {
     if (!envelope || envelope.reward === undefined) return res.status(400).json({ error: 'Provide { envelope } (a signed reward receipt)' });
     const result = verifyReward(envelope, verifyFn, pubFromEnv(envelope));
     res.json({ product: 'AFiR-S3 Reward-Attestation', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// ===========================================================================
+// GCA + GiTM — per-claim grounding attestation + cross-signal anomaly flag.
+// Honest rails: GCA proves SUPPORT not truth; GiTM asserts PROVENANCE ANOMALY ONLY,
+// never falsity. Both ride the existing ML-DSA-65 signer + zero-secret verify.
+// ===========================================================================
+
+// --- GCA: Per-Claim Grounding Attestation (rides ARSC) ---
+app.post('/sigr/gca', (req, res) => {
+  try {
+    const body = req.body || {};
+    const gca = body.grounding_claims || body.gca || body;
+    if (!gca || !gca.method_hash || !Array.isArray(gca.claims) || gca.claims.length === 0) {
+      return res.status(400).json({ error: 'Provide { grounding_claims: { method_hash, answer_id?, claims:[{ claim_id?, claim?|claim_hash, support: "0x..."|null, support_strength?|support_strength_bp? }] } }' });
+    }
+    const { envelope, timing_us } = signGca(gca, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'GCA', patent_pending: 'Patent Pending', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'gca_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/gca/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.claims_root) return res.status(400).json({ error: 'Provide { envelope } (a signed GCA receipt)' });
+    const result = verifyGca(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'GCA', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- GiTM: Glitch in the Matrix — cross-signal anomaly flag (rides SiGR) ---
+app.post('/sigr/gitm', (req, res) => {
+  try {
+    const body = req.body || {};
+    const gitm = body.gitm || body;
+    if (!gitm || (!gitm.signals && gitm.grounding_anomaly === undefined && gitm.cross_run_divergence === undefined)) {
+      return res.status(400).json({ error: 'Provide { gitm: { subject_id?, claims_root_ref?, signals: { grounding_anomaly, identity_flicker, chain_irregularity, cross_run_divergence, under_attested_high_stakes }, trigger_bp? } }' });
+    }
+    const { envelope, timing_us } = signGitm(gitm, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'GiTM', patent_pending: 'Patent Pending', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'gitm_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/gitm/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.decision_digest) return res.status(400).json({ error: 'Provide { envelope } (a signed GiTM receipt)' });
+    const result = verifyGitm(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'GiTM', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
   }
