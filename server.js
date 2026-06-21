@@ -45,6 +45,7 @@ import { signGca, verifyGca } from './src/gca.js';                            //
 import { signGitm, verifyGitm } from './src/gitm.js';                         // GiTM — cross-signal anomaly flag
 import { signCacheEntry, verifyCacheEntry } from './src/cachesign.js';         // P3 — KV cache prefix signing
 import { signManifest, verifyManifest } from './src/manifest.js';              // P4 — model manifest attestation
+import { signMir, verifyMir } from './src/mir.js';                              // MiR — model-identity & relineage
 
 // item 1: signing-backend swap point. Software today; FPGA/ASIC drop-in later.
 // Selected via HIVE_SIGN_BACKEND (default SOFTWARE). The wrapped signer keeps
@@ -121,6 +122,8 @@ app.get('/', (req, res) => {
       'POST /sigr/cachesign/verify': 'Verify a KV cache receipt (free)',
       'POST /sigr/manifest': 'AFiR Model Manifest — TEE-less streaming model attestation',
       'POST /sigr/manifest/verify': 'Verify a model manifest receipt (free)',
+      'POST /sigr/mir': 'MiR — model-identity & relineage (binds served-model lineage, detects substitution; asserts identity only)',
+      'POST /sigr/mir/verify': 'Verify a MiR receipt (free)',
       'GET /health': 'Health check',
     },
     products: {
@@ -593,10 +596,25 @@ app.post('/sigr/gitm', (req, res) => {
   try {
     const body = req.body || {};
     const gitm = body.gitm || body;
+    // Source the identity_flicker signal from a REAL signed MiR receipt when supplied.
+    // The MiR receipt is verified here; only if valid do we take its signed
+    // identity_flicker_bp as the authoritative identity signal (overriding any
+    // caller-asserted number). This makes the GiTM->MiR link trustless.
+    let mir_source = null;
+    if (body.mir_receipt) {
+      const mirResult = verifyMir(body.mir_receipt, verifyFn, pubFromEnv(body.mir_receipt));
+      if (!mirResult.valid) {
+        return res.status(400).json({ ok: false, error: 'mir_receipt_invalid', reasons: mirResult.reasons });
+      }
+      gitm.signals = gitm.signals || {};
+      gitm.signals.identity_flicker_bp = body.mir_receipt.identity_flicker_bp | 0;
+      mir_source = { identity_root: body.mir_receipt.identity_root, identity_flicker_bp: body.mir_receipt.identity_flicker_bp | 0 };
+    }
     if (!gitm || (!gitm.signals && gitm.grounding_anomaly === undefined && gitm.cross_run_divergence === undefined)) {
-      return res.status(400).json({ error: 'Provide { gitm: { subject_id?, claims_root_ref?, signals: { grounding_anomaly, identity_flicker, chain_irregularity, cross_run_divergence, under_attested_high_stakes }, trigger_bp? } }' });
+      return res.status(400).json({ error: 'Provide { gitm: { subject_id?, claims_root_ref?, signals: { grounding_anomaly, identity_flicker, chain_irregularity, cross_run_divergence, under_attested_high_stakes }, trigger_bp? } } — or pass { mir_receipt } to source identity_flicker from a signed MiR receipt' });
     }
     const { envelope, timing_us } = signGitm(gitm, SIGNER, { hashSuite: body.hash_suite });
+    if (mir_source) envelope.mir_source = mir_source;
     res.json({ ok: true, product: 'GiTM', patent_pending: 'Patent Pending', envelope, timing_us });
   } catch (err) {
     res.status(400).json({ ok: false, error: 'gitm_sign_rejected', message: err.message });
@@ -685,6 +703,32 @@ app.post('/sigr/manifest/verify', (req, res) => {
     if (!envelope || !envelope.manifest_root) return res.status(400).json({ error: 'Provide { envelope } (a signed manifest receipt)' });
     const result = verifyManifest(envelope, verifyFn, pubFromEnv(envelope));
     res.json({ product: 'AFiR Model Manifest', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- MiR — Model-Identity & Relineage (binds served-model lineage, detects substitution) ---
+app.post('/sigr/mir', (req, res) => {
+  try {
+    const body = req.body || {};
+    const mir = body.mir || body;
+    if (!mir || !Array.isArray(mir.steps) || mir.steps.length === 0) {
+      return res.status(400).json({ error: 'Provide { mir: { subject_id?, expected_model?, steps: [ { model_id, weights_sha3, config_hash, endpoint, manifest_nullifier? }, ... ] } }' });
+    }
+    const { envelope, timing_us } = signMir(mir, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'MiR', patent_pending: 'Patent Pending', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'mir_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/mir/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.lineage_digest) return res.status(400).json({ error: 'Provide { envelope } (a signed MiR receipt). Optionally include { steps } to verify per-step roots against raw identities.' });
+    const result = verifyMir(envelope, verifyFn, pubFromEnv(envelope), { steps: body.steps });
+    res.json({ product: 'MiR', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
   }
