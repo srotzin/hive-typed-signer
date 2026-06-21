@@ -43,6 +43,8 @@ import { signReward, verifyReward } from './src/reward.js';                  // 
 import { mintToolAnchor, verifyToolAnchor, resolveToolCall, verifyToolSavingsProof } from './src/toolreuse.js';
 import { signGca, verifyGca } from './src/gca.js';                            // GCA — per-claim grounding attestation
 import { signGitm, verifyGitm } from './src/gitm.js';                         // GiTM — cross-signal anomaly flag
+import { signCacheEntry, verifyCacheEntry } from './src/cachesign.js';         // P3 — KV cache prefix signing
+import { signManifest, verifyManifest } from './src/manifest.js';              // P4 — model manifest attestation
 
 // item 1: signing-backend swap point. Software today; FPGA/ASIC drop-in later.
 // Selected via HIVE_SIGN_BACKEND (default SOFTWARE). The wrapped signer keeps
@@ -115,6 +117,10 @@ app.get('/', (req, res) => {
       'POST /sigr/gca/verify': 'Verify a GCA receipt (free)',
       'POST /sigr/gitm': 'GiTM — cross-signal anomaly flag (asserts provenance anomaly only)',
       'POST /sigr/gitm/verify': 'Verify a GiTM receipt (free)',
+      'POST /sigr/cachesign': 'AFiR KV Cache Signing — sign vLLM prefix entries at write time',
+      'POST /sigr/cachesign/verify': 'Verify a KV cache receipt (free)',
+      'POST /sigr/manifest': 'AFiR Model Manifest — TEE-less streaming model attestation',
+      'POST /sigr/manifest/verify': 'Verify a model manifest receipt (free)',
       'GET /health': 'Health check',
     },
     products: {
@@ -627,6 +633,58 @@ app.post('/sigr/toolanchor/verify', (req, res) => {
     if (!anchor || !anchor.identity_key) return res.status(400).json({ error: 'Provide { anchor }' });
     const result = verifyToolAnchor(anchor, verifyFn, pubFromEnv(anchor));
     res.json({ product: 'AFiR-S3 Tool Anchor', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- AFiR KV Cache Signing (P3) — sign vLLM prefix entries at write time ---
+app.post('/sigr/cachesign', (req, res) => {
+  try {
+    const body = req.body || {};
+    const entry = body.cache || body.entry || body;
+    if (!entry || !entry.prefix_hash || !entry.model_id) {
+      return res.status(400).json({ error: 'Provide { cache: { model_id, prefix_hash, block_ids?:[], token_span?:{start,end}, parent_cache_receipt? } }' });
+    }
+    const { envelope, timing_us } = signCacheEntry(entry, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR KV Cache Signing', patent_pending: 'Patent Pending', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'cache_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/cachesign/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.prefix_root) return res.status(400).json({ error: 'Provide { envelope } (a signed cache receipt)' });
+    const result = verifyCacheEntry(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'AFiR KV Cache Signing', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- AFiR Model Manifest (P4) — TEE-less streaming model attestation ---
+app.post('/sigr/manifest', (req, res) => {
+  try {
+    const body = req.body || {};
+    const manifest = body.manifest || body;
+    if (!manifest || !manifest.model_id || !manifest.weights_sha3 || !manifest.config_hash || !manifest.endpoint) {
+      return res.status(400).json({ error: 'Provide { manifest: { model_id, weights_sha3, config_hash, endpoint, nullifier? } }' });
+    }
+    const { envelope, timing_us } = signManifest(manifest, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR Model Manifest', patent_pending: 'Patent Pending', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'manifest_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/manifest/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.manifest_root) return res.status(400).json({ error: 'Provide { envelope } (a signed manifest receipt)' });
+    const result = verifyManifest(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'AFiR Model Manifest', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
   }
