@@ -33,6 +33,14 @@ import { signBillReceipt, verifyBillReceipt, signInvoice, verifyInvoice } from '
 import { signBond, verifyBond, signMeasurement, verifyMeasurement, signSettlement, verifySettlement } from './src/bond.js';
 import { signChain, verifyChain } from './src/chain.js';
 import { signSubReceipt, verifySubReceipt, signConsensus, verifyConsensus } from './src/consensus.js';
+// AFiR-S3 — Agentic Provenance Primitives. Each rides the same typed-signer
+// discipline (canonicalize -> hash -> bind -> ONE ML-DSA-65 sig -> recompute +
+// verify). Built on SiGR/AFiR/ARSC/AFiR-S2 as substrate, not rebuilt.
+import { signToolScope, verifyToolScope } from './src/toolscope.js';         // HC-2026-008
+import { signAgenticRun, verifyAgenticRun } from './src/agentic.js';         // HC-2026-009
+import { signCern, verifyCern } from './src/cern.js';                        // HC-2026-010 (files first)
+import { signReward, verifyReward } from './src/reward.js';                  // HC-2026-011
+import { mintToolAnchor, verifyToolAnchor, resolveToolCall, verifyToolSavingsProof } from './src/toolreuse.js';
 
 // item 1: signing-backend swap point. Software today; FPGA/ASIC drop-in later.
 // Selected via HIVE_SIGN_BACKEND (default SOFTWARE). The wrapped signer keeps
@@ -419,6 +427,142 @@ app.post('/sigr/consensus/verify', (req, res) => {
     if (!envelope || !envelope.panel_id) return res.status(400).json({ error: 'Provide { envelope, sub_receipts }' });
     const result = verifyConsensus(envelope, subEnvs, verifyFn, pubFromEnv(envelope));
     res.json({ product: 'SiGR-Consensus', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// ===========================================================================
+// AFiR-S3 — Agentic Provenance Primitives (HC-2026-008..011)
+// Verified agents: receipts for what an agent does, observes, alters, forgets,
+// and is rewarded for. All ride the existing ML-DSA-65 signer + zero-secret verify.
+// ===========================================================================
+
+// --- Tool-Scope Receipt (BEFORE) — HC-2026-008 ---
+app.post('/sigr/toolscope', (req, res) => {
+  try {
+    const body = req.body || {};
+    const scope = body.scope || body;
+    if (!scope || !scope.scope_id || !Array.isArray(scope.tools) || scope.tools.length === 0) {
+      return res.status(400).json({ error: 'Provide { scope: { scope_id, agent_ref, tools:[{tool_id, tool_hash?}], destructive_tools:[], granted_by } }' });
+    }
+    const { envelope, timing_us } = signToolScope(scope, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR-S3 Tool-Scope', patent_pending: 'HC-2026-008', envelope, timing_us });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'toolscope_sign_failed', message: err.message });
+  }
+});
+app.post('/sigr/toolscope/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.scope_id) return res.status(400).json({ error: 'Provide { envelope } (a signed tool-scope)' });
+    const result = verifyToolScope(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'AFiR-S3 Tool-Scope', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- Agentic Action Receipt (DURING) — HC-2026-009 — thin wrapper over chain.js, SCOPE-GATED ---
+app.post('/sigr/agentic', (req, res) => {
+  try {
+    const body = req.body || {};
+    const run = body.run;
+    const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+    if (!run || !run.run_id || !Array.isArray(run.steps) || run.steps.length === 0) {
+      return res.status(400).json({ error: 'Provide { run: { run_id, agent_ref, steps:[{step_id,kind,seq,parents,input,action?,tool_target?,tool_hash?,scope_ref?}] }, scopes:[ signed tool-scope envelopes ] }' });
+    }
+    const { envelope, timing_us } = signAgenticRun(run, scopes, SIGNER, verifyFn, pubFromEnv, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR-S3 Agentic Action', patent_pending: 'HC-2026-009', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'agentic_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/agentic/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+    if (!envelope || !Array.isArray(envelope.steps)) return res.status(400).json({ error: 'Provide { envelope, scopes:[] }' });
+    const result = verifyAgenticRun(envelope, scopes, verifyFn, pubFromEnv);
+    res.json({ product: 'AFiR-S3 Agentic Action', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- AFiR-CERN: Context Ethics & Retention Notarization (DURING) — HC-2026-010 (files first) ---
+app.post('/sigr/cern', (req, res) => {
+  try {
+    const body = req.body || {};
+    const mutation = body.mutation || body;
+    if (!mutation || !mutation.mutation_type) {
+      return res.status(400).json({ error: 'Provide { mutation: { mutation_type, context_before|context_before_digests+root, context_after|..., altered_spans?, integrity_claim } }' });
+    }
+    const { envelope, timing_us } = signCern(mutation, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR-CERN', patent_pending: 'HC-2026-010', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'cern_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/cern/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || !envelope.mutation_type) return res.status(400).json({ error: 'Provide { envelope } (a signed CERN receipt)' });
+    const result = verifyCern(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'AFiR-CERN', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- Reward-Attestation Receipt (AFTER) — HC-2026-011 ---
+app.post('/sigr/reward', (req, res) => {
+  try {
+    const body = req.body || {};
+    const reward = body.reward_attestation || body;
+    if (!reward || reward.reward === undefined || !reward.reward_model_hash) {
+      return res.status(400).json({ error: 'Provide { reward_attestation: { trajectory_root|step_receipt_digests, reward, reward_model_hash, algo, episode_id? } }' });
+    }
+    const { envelope, timing_us } = signReward(reward, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR-S3 Reward-Attestation', patent_pending: 'HC-2026-011', envelope, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'reward_sign_rejected', message: err.message });
+  }
+});
+app.post('/sigr/reward/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const envelope = body.envelope !== undefined ? body.envelope : body;
+    if (!envelope || envelope.reward === undefined) return res.status(400).json({ error: 'Provide { envelope } (a signed reward receipt)' });
+    const result = verifyReward(envelope, verifyFn, pubFromEnv(envelope));
+    res.json({ product: 'AFiR-S3 Reward-Attestation', ...result, verified_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
+  }
+});
+
+// --- Tool-call trust-anchor reuse (AFiR-S3 §3, byte-identity R2) — mint + verify ---
+app.post('/sigr/toolanchor', (req, res) => {
+  try {
+    const body = req.body || {};
+    const call = body.call || body;
+    if (!call || !call.tool_id) return res.status(400).json({ error: 'Provide { call: { tool_id, tool_hash?, input, output, deterministic:true, holder } }' });
+    const { anchor, timing_us } = mintToolAnchor(call, SIGNER, { hashSuite: body.hash_suite });
+    res.json({ ok: true, product: 'AFiR-S3 Tool Anchor', patent_pending: 'HC-2026-008', anchor, timing_us });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: 'toolanchor_mint_rejected', message: err.message });
+  }
+});
+app.post('/sigr/toolanchor/verify', (req, res) => {
+  try {
+    const body = req.body || {};
+    const anchor = body.anchor !== undefined ? body.anchor : body;
+    if (!anchor || !anchor.identity_key) return res.status(400).json({ error: 'Provide { anchor }' });
+    const result = verifyToolAnchor(anchor, verifyFn, pubFromEnv(anchor));
+    res.json({ product: 'AFiR-S3 Tool Anchor', ...result, verified_at: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
   }
