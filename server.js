@@ -46,6 +46,13 @@ import { signGitm, verifyGitm } from './src/gitm.js';                         //
 import { signCacheEntry, verifyCacheEntry } from './src/cachesign.js';         // P3 — KV cache prefix signing
 import { signManifest, verifyManifest } from './src/manifest.js';              // P4 — model manifest attestation
 import { signMir, verifyMir } from './src/mir.js';                              // MiR — model-identity & relineage
+// Carnac digest signing contract — narrow backwards-compatible add-on to /sign
+// and /verify: bind + sign a caller-supplied SHA-256 digest with the same real
+// ML-DSA-65 engine. Never touches typed-fragment clients.
+import {
+  signDigestBinding, verifyDigestBinding, normalizeAlgo, isValidSha256Hex,
+  checkInternalToken, authConfigured,
+} from './src/carnac.js';
 
 // item 1: signing-backend swap point. Software today; FPGA/ASIC drop-in later.
 // Selected via HIVE_SIGN_BACKEND (default SOFTWARE). The wrapped signer keeps
@@ -80,6 +87,22 @@ app.use((req, res, next) => {
 });
 
 const DEFAULT_SIGN_TYPES = ['reasoning', 'tool_call', 'final', 'decomposition'];
+
+// Lightweight fixed-window in-memory rate limiter for the public Carnac digest
+// verify path. Keyed by client IP. Bounds abuse without adding a dependency.
+const RL_WINDOW_MS = 60_000;
+const RL_MAX = Number(process.env.CARNAC_VERIFY_RATE_MAX || 240);
+const rlBuckets = new Map();
+function rateLimited(key) {
+  const now = Date.now();
+  if (rlBuckets.size > 10_000) {
+    for (const [k, v] of rlBuckets) if (now >= v.reset) rlBuckets.delete(k);
+  }
+  let e = rlBuckets.get(key);
+  if (!e || now >= e.reset) { e = { count: 0, reset: now + RL_WINDOW_MS }; rlBuckets.set(key, e); }
+  e.count++;
+  return e.count > RL_MAX;
+}
 
 function textToItems(text) {
   const parts = String(text)
@@ -170,8 +193,28 @@ app.get('/signing-backends', (req, res) => {
 });
 
 app.post('/sign', (req, res) => {
+  const body = req.body || {};
+  // Carnac digest signing contract (backwards-compatible): when a precomputed
+  // digest is supplied, bind + sign exactly that digest and return flat fields.
+  // Existing typed-fragment clients (text/fragments) are untouched.
+  if (body.payload_sha256 !== undefined) {
+    if (authConfigured() && !checkInternalToken(req.get('X-Hive-Internal-Token'))) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (!isValidSha256Hex(body.payload_sha256)) {
+      return res.status(400).json({ error: 'invalid_payload_sha256' });
+    }
+    if (normalizeAlgo(body.algo) === null) {
+      return res.status(400).json({ error: 'unsupported_algo' });
+    }
+    try {
+      return res.json(signDigestBinding(body.payload_sha256, body.algo, SIGNER));
+    } catch (err) {
+      // Generic error — never echo the payload back.
+      return res.status(400).json({ error: 'sign_failed' });
+    }
+  }
   try {
-    const body = req.body || {};
     let items;
     if (Array.isArray(body.fragments) && body.fragments.length) {
       items = body.fragments.map((f, i) =>
@@ -275,8 +318,18 @@ app.post('/sign-qpuf', (req, res) => {
 });
 
 app.post('/verify', (req, res) => {
+  const body = req.body || {};
+  // Carnac digest verify contract (backwards-compatible): independently verify
+  // a { payload_sha256, signature, public_key, algo } binding. Public + rate
+  // limited. Existing typed-fragment verify ({ envelope, fragments }) untouched.
+  if (body.payload_sha256 !== undefined) {
+    const ip = req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+    if (rateLimited('verify:' + ip)) {
+      return res.status(429).json({ error: 'rate_limited' });
+    }
+    return res.json(verifyDigestBinding(body.payload_sha256, body.signature, body.public_key, body.algo, verifyFn));
+  }
   try {
-    const body = req.body || {};
     const envelope = body.envelope !== undefined ? body.envelope : body;
     const fragmentsCanon = body.fragments || body.fragments_canon;
     if (!envelope || !Array.isArray(fragmentsCanon)) {
