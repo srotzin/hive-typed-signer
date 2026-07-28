@@ -46,6 +46,18 @@ import { signGitm, verifyGitm } from './src/gitm.js';                         //
 import { signCacheEntry, verifyCacheEntry } from './src/cachesign.js';         // P3 — KV cache prefix signing
 import { signManifest, verifyManifest } from './src/manifest.js';              // P4 — model manifest attestation
 import { signMir, verifyMir } from './src/mir.js';                              // MiR — model-identity & relineage
+// Upstream Signed Pre-Effect Attestation (USPA) — the seven primitives that fire
+// BEFORE an effect lands, sharing one signed envelope (src/upstream.js). Each
+// binds a small declared payload into ONE ML-DSA-65 signature over a
+// recomputable payload_root, and carries its own freshness window.
+import { signUpstreamReceipt, verifyUpstreamReceipt, gateOnReceipts, DEFAULT_TTL, USAP_VERSION } from './src/upstream.js';
+import { signPbsManifest, signPbsAttestation, verifyPbsManifest, verifyPbsAttestation, verifyPbsAttestationChain } from './src/pbs.js';                    // HC-2026-016
+import { signPolicyMutation, signPolicyReadBinding, verifyPolicyMutation, verifyPolicyReadBinding, verifyPolicyMutationInHistory } from './src/refusal.js'; // HC-2026-017
+import { signHowlerDrift, signHowlerCapability, signHowlerContamination, verifyHowlerDrift, verifyHowlerCapability, verifyHowlerContamination, verifyHowlerCapabilityWithSae } from './src/howler.js'; // HC-2026-018
+import { signPerimeterManifest, signPerimeterAttempt, verifyPerimeterManifest, verifyPerimeterAttempt, verifyPerimeterAttemptAgainstManifest } from './src/perimeter.js'; // HC-2026-019
+import { signDiurnalRegime, signDiurnalAttestation, verifyDiurnalRegime, verifyDiurnalAttestation, verifyDiurnalThresholdSatisfied } from './src/diurnal.js';             // HC-2026-020
+import { signEgressManifest, signEgressMeasurement, verifyEgressManifest, verifyEgressMeasurement } from './src/egress.js';                                               // HC-2026-021
+import { signForensicCredential, signForensicAnalysis, verifyForensicCredential, verifyForensicAnalysis } from './src/forensic.js';                                       // HC-2026-022
 // Carnac digest signing contract — narrow backwards-compatible add-on to /sign
 // and /verify: bind + sign a caller-supplied SHA-256 digest with the same real
 // ML-DSA-65 engine. Never touches typed-fragment clients.
@@ -147,6 +159,8 @@ app.get('/', (req, res) => {
       'POST /sigr/manifest/verify': 'Verify a model manifest receipt (free)',
       'POST /sigr/mir': 'MiR — model-identity & relineage (binds served-model lineage, detects substitution; asserts identity only)',
       'POST /sigr/mir/verify': 'Verify a MiR receipt (free)',
+      'GET /sigr/upstream': 'Upstream pre-effect suite catalog — the seven primitives and their contracts',
+      'POST /sigr/upstream/gate': 'Refuse an action unless every required upstream receipt verifies fresh',
       'GET /health': 'Health check',
     },
     products: {
@@ -155,6 +169,13 @@ app.get('/', (req, res) => {
       'SiGR Chain': 'HC-2026-006',
       'SiGR-Consensus': 'HC-2026-007',
       'QPuF': 'HC-2026-001',
+      'Provenance-Bonded Sandbox': 'HC-2026-016',
+      'Refusal Ledger': 'HC-2026-017',
+      'Howler': 'HC-2026-018',
+      'Perimeter Bond': 'HC-2026-019',
+      'Diurnal Bond': 'HC-2026-020',
+      'Egress Bond': 'HC-2026-021',
+      'Forensic Rail': 'HC-2026-022',
     },
     fragment_types: FRAGMENT_TYPES,
     patent_pending: 'HC-2026-001',
@@ -785,6 +806,214 @@ app.post('/sigr/mir/verify', (req, res) => {
   } catch (err) {
     res.status(500).json({ valid: false, reasons: ['verify_error:' + err.message] });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Upstream Signed Pre-Effect Attestation — the seven primitives (HC-2026-016..022)
+//
+// These fire BEFORE an effect lands, which is what separates them from the SiGR
+// family above: SiGR records what a model did, these bound what it is allowed to
+// do and refuse the action when the bound is not proven. All fifteen receipt
+// types share the src/upstream.js envelope, so one verifier handles every one:
+// recompute payload_root from the carried payload, recompute the canonical
+// envelope without its signature, check the ML-DSA-65 signature, check freshness.
+//
+// Signing is metered. Verification is free and needs nothing but the receipt and
+// the published public key. Where a primitive has a cross-receipt coupling rule,
+// the verify route accepts the extra material and runs it, mirroring the
+// optional { steps } convention on /sigr/mir/verify.
+// ---------------------------------------------------------------------------
+const UPSTREAM_ROUTES = [
+  {
+    path: 'pbs/manifest', type: 'pbs.manifest', product: 'PBS Manifest', patent: 'HC-2026-016',
+    key: 'env', sign: signPbsManifest, verify: verifyPbsManifest,
+    hint: '{ env: { run_id, tenant_id, image_digests: [...], kernel_modules: [...], package_index, egress_acl, gpu_firmware, attestor_kid } }',
+    couple: (body, envelope) => Array.isArray(body.heartbeats) && body.heartbeats.length
+      ? { chain: verifyPbsAttestationChain(envelope, body.heartbeats, verifyFn, pubFromEnv(envelope)) } : null,
+  },
+  {
+    path: 'pbs/attestation', type: 'pbs.attestation', product: 'PBS Attestation', patent: 'HC-2026-016',
+    key: 'beat', sign: signPbsAttestation, verify: verifyPbsAttestation,
+    hint: '{ beat: { run_id, tenant_id, heartbeat_seq, prior_accumulator_root, measurements: [ { artifact_id, measured_digest, ts } ] } }',
+  },
+  {
+    path: 'refusal/mutation', type: 'refusal.mutation', product: 'Refusal Ledger Mutation', patent: 'HC-2026-017',
+    key: 'mutation', sign: signPolicyMutation, verify: verifyPolicyMutation,
+    hint: '{ mutation: { run_id, tenant_id, policy_id, ledger_seq, prior_state, new_state, prior_mutations?, operator_kid?, authorization_ref? } }',
+    couple: (body, envelope) => Array.isArray(body.prior_mutations)
+      ? { history: verifyPolicyMutationInHistory(envelope, body.prior_mutations, verifyFn, pubFromEnv(envelope)) } : null,
+  },
+  {
+    path: 'refusal/binding', type: 'refusal.binding', product: 'Refusal Ledger Read Binding', patent: 'HC-2026-017',
+    key: 'binding', sign: signPolicyReadBinding, verify: verifyPolicyReadBinding,
+    hint: '{ binding: { run_id, tenant_id, envelope_id, envelope_bounds, policy_value_bp?, blinding_hex?, policy_id?, ledger_seq_at_read? } }',
+  },
+  {
+    path: 'howler/drift', type: 'howler.drift', product: 'Howler Drift Alarm', patent: 'HC-2026-018',
+    key: 'alarm', sign: signHowlerDrift, verify: verifyHowlerDrift,
+    hint: '{ alarm: { run_id, tenant_id, trace_tokens: [...], drift_score_bp, expected_task_shape_ref?, drift_threshold_bp?, token_position_at_trigger? } }',
+  },
+  {
+    path: 'howler/capability', type: 'howler.capability', product: 'Howler Capability Alarm', patent: 'HC-2026-018',
+    key: 'alarm', sign: signHowlerCapability, verify: verifyHowlerCapability,
+    hint: '{ alarm: { run_id, tenant_id, trace_tokens: [...], requested_capability_id, sae_feature_indices?, sae_feature_magnitudes_bp?, scope_ref?, sae_probe_id? } }',
+    // verifyHowlerCapabilityWithSae takes a probe *function*, which cannot cross
+    // JSON. Over HTTP the caller submits the vector their own probe produced from
+    // the same trace, and we check it reproduces the signed digest.
+    couple: (body, envelope) => (body.sae_probe && Array.isArray(body.trace_tokens))
+      ? { sae_replay: verifyHowlerCapabilityWithSae(
+          envelope,
+          () => ({ indices: body.sae_probe.indices, magnitudes_bp: body.sae_probe.magnitudes_bp }),
+          body.trace_tokens, verifyFn, pubFromEnv(envelope)) } : null,
+  },
+  {
+    path: 'howler/contamination', type: 'howler.contamination', product: 'Howler Contamination Alarm', patent: 'HC-2026-018',
+    key: 'alarm', sign: signHowlerContamination, verify: verifyHowlerContamination,
+    hint: '{ alarm: { run_id, tenant_id, contamination_class, contamination_entropy_bits?, regex_pattern_id?, position_at_detect?, matched_span_digest? } }',
+  },
+  {
+    path: 'perimeter/manifest', type: 'perimeter.manifest', product: 'Perimeter Bond Manifest', patent: 'HC-2026-019',
+    key: 'manifest', sign: signPerimeterManifest, verify: verifyPerimeterManifest,
+    hint: '{ manifest: { run_id, tenant_id, ebpf_program_hash, allowed_targets: [ { target_host, resolution } ], ebpf_program_kid?, enforcement_mode? } }',
+  },
+  {
+    path: 'perimeter/attempt', type: 'perimeter.attempt', product: 'Perimeter Bond Attempt', patent: 'HC-2026-019',
+    key: 'attempt', sign: signPerimeterAttempt, verify: verifyPerimeterAttempt,
+    hint: '{ attempt: { run_id, tenant_id, target_host, resolution, target_port?, target_protocol?, matched_manifest_rule_id?, ebpf_program_hash?, kernel_syscall_ts? } }',
+    couple: (body, envelope) => body.manifest
+      ? { against_manifest: verifyPerimeterAttemptAgainstManifest(envelope, body.manifest, verifyFn, pubFromEnv(envelope)) } : null,
+  },
+  {
+    path: 'diurnal/regime', type: 'diurnal.regime', product: 'Diurnal Bond Regime', patent: 'HC-2026-020',
+    key: 'regime', sign: signDiurnalRegime, verify: verifyDiurnalRegime,
+    hint: '{ regime: { run_id, tenant_id, regime, action_class?, risk_manifold?, attestor_kid_set?, regime_start_ts?, regime_end_ts? } }',
+    couple: (body, envelope) => Array.isArray(body.attestations) && body.attestations.length
+      ? { threshold: verifyDiurnalThresholdSatisfied(envelope, body.attestations, verifyFn, pubFromEnv(envelope)) } : null,
+  },
+  {
+    path: 'diurnal/attestation', type: 'diurnal.attestation', product: 'Diurnal Bond Attestation', patent: 'HC-2026-020',
+    key: 'attestation', sign: signDiurnalAttestation, verify: verifyDiurnalAttestation,
+    hint: '{ attestation: { run_id, tenant_id, regime_ref, attestor_kid, attestor_geo_region?, countersign_ts?, action_class? } }',
+  },
+  {
+    path: 'egress/manifest', type: 'egress.manifest', product: 'Egress Bond Manifest', patent: 'HC-2026-021',
+    key: 'manifest', sign: signEgressManifest, verify: verifyEgressManifest,
+    hint: '{ manifest: { run_id, tenant_id, per_class_row_caps: { class: n }, per_class_byte_caps?, classifier_weights_digest?, commitment_seed?, retroactive_invalidation?, sigr_chain_ref? } }',
+  },
+  {
+    path: 'egress/measurement', type: 'egress.measurement', product: 'Egress Bond Measurement', patent: 'HC-2026-021',
+    key: 'measurement', sign: signEgressMeasurement, verify: verifyEgressMeasurement,
+    hint: '{ measurement: { run_id, tenant_id, per_class_rows_this_window: { class: n }, per_class_row_caps, prior_commitments?, commitment_seed?, window_start_ts?, window_end_ts?, sigr_chain_ref? } }',
+  },
+  {
+    path: 'forensic/credential', type: 'forensic.credential', product: 'Forensic Rail Credential', patent: 'HC-2026-022',
+    key: 'credential', sign: signForensicCredential, verify: verifyForensicCredential,
+    hint: '{ credential: { run_id, tenant_id, incident_case_id, threshold_k, consortium_signers: [ { kid } ], scope?, no_execute?, no_generate_novel?, valid_from_ts?, valid_until_ts? } }',
+  },
+  {
+    path: 'forensic/analysis', type: 'forensic.analysis', product: 'Forensic Rail Analysis', patent: 'HC-2026-022',
+    key: 'analysis', sign: signForensicAnalysis, verify: verifyForensicAnalysis,
+    hint: '{ analysis: { run_id, tenant_id, credential_ref, prompt_digest, output_digest, temperature_bp?, model_ref?, seed?, top_p_bp?, kv_cache_digest?, responder_kid? } }',
+  },
+];
+
+for (const r of UPSTREAM_ROUTES) {
+  // ---- sign (metered) ----
+  app.post('/sigr/' + r.path, (req, res) => {
+    try {
+      const body = req.body || {};
+      const payload = body[r.key] !== undefined ? body[r.key] : body;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return res.status(400).json({ ok: false, error: 'missing_payload', expected: r.hint });
+      }
+      const t0 = process.hrtime.bigint();
+      const envelope = r.sign(payload, SIGNER, { hashSuite: body.hash_suite });
+      const sign_us = Number(process.hrtime.bigint() - t0) / 1000;
+      res.json({
+        ok: true, product: r.product, receipt_type: r.type,
+        patent_pending: 'Patent Pending ' + r.patent,
+        usap_version: USAP_VERSION, ttl_seconds: DEFAULT_TTL[r.type],
+        envelope, timing_us: { sign_us },
+      });
+    } catch (err) {
+      res.status(400).json({ ok: false, error: 'upstream_sign_rejected', receipt_type: r.type, message: err.message, expected: r.hint });
+    }
+  });
+
+  // ---- verify (free) ----
+  app.post('/sigr/' + r.path + '/verify', (req, res) => {
+    try {
+      const body = req.body || {};
+      const envelope = body.envelope !== undefined ? body.envelope : body;
+      if (!envelope || typeof envelope !== 'object' || !envelope.sig) {
+        return res.status(400).json({ error: 'Provide { envelope } (a signed ' + r.type + ' receipt).' });
+      }
+      const t0 = process.hrtime.bigint();
+      const result = r.verify(envelope, verifyFn, pubFromEnv(envelope), { allow_expired: body.allow_expired === true });
+      const verify_us = Number(process.hrtime.bigint() - t0) / 1000;
+      const extra = (r.couple && result.ok) ? r.couple(body, envelope) : null;
+      res.json({
+        product: r.product, receipt_type: r.type, ...result,
+        ...(extra || {}), timing_us: { verify_us },
+        verified_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, reasons: ['verify_error:' + err.message] });
+    }
+  });
+}
+
+// Carnac-style aggregate gate. Refuses the action unless every required receipt
+// verifies fresh. This is the point of the seven: a caller proves the bound
+// before the effect, and the refusal is itself a determinate answer.
+app.post('/sigr/upstream/gate', (req, res) => {
+  try {
+    const body = req.body || {};
+    const required = body.required;
+    if (!Array.isArray(required) || !required.length) {
+      return res.status(400).json({ error: 'Provide { required: [ { type, receipt }, ... ] } where type is one of the fifteen upstream receipt types.' });
+    }
+    const t0 = process.hrtime.bigint();
+    const pub = pubFromEnv(required[0] && required[0].receipt);
+    const result = gateOnReceipts(required, verifyFn, pub, { allow_expired: body.allow_expired === true });
+    const gate_us = Number(process.hrtime.bigint() - t0) / 1000;
+    res.json({
+      product: 'Upstream Gate', usap_version: USAP_VERSION,
+      allow: result.allow, refusals: result.refusals,
+      checked: required.length, timing_us: { gate_us },
+      patent_pending: 'Patent Pending HC-2026-016 through HC-2026-022',
+      gated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ allow: false, reasons: ['gate_error:' + err.message] });
+  }
+});
+
+// Machine-readable catalog of the seven, so a caller can discover the contracts.
+app.get('/sigr/upstream', (req, res) => {
+  res.json({
+    suite: 'Upstream Signed Pre-Effect Attestation',
+    usap_version: USAP_VERSION,
+    algorithm: 'ML-DSA-65',
+    spec: 'NIST FIPS 204',
+    description: 'Seven primitives that fire before an effect lands. Each binds a declared payload into one ML-DSA-65 signature over a recomputable payload_root, with its own freshness window.',
+    primitives: {
+      'Provenance-Bonded Sandbox': 'HC-2026-016',
+      'Refusal Ledger':            'HC-2026-017',
+      'Howler':                    'HC-2026-018',
+      'Perimeter Bond':            'HC-2026-019',
+      'Diurnal Bond':              'HC-2026-020',
+      'Egress Bond':               'HC-2026-021',
+      'Forensic Rail':             'HC-2026-022',
+    },
+    receipt_types: UPSTREAM_ROUTES.map(r => ({
+      receipt_type: r.type, product: r.product, patent_pending: r.patent,
+      sign: 'POST /sigr/' + r.path, verify: 'POST /sigr/' + r.path + '/verify',
+      ttl_seconds: DEFAULT_TTL[r.type], body: r.hint,
+    })),
+    gate: 'POST /sigr/upstream/gate',
+    verify_is_free: true,
+  });
 });
 
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path }));

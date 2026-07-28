@@ -67,13 +67,39 @@ export const DEFAULT_TTL = {
   'forensic.analysis':    300,
 };
 
+/**
+ * Drop keys whose value is undefined, recursively.
+ *
+ * Every primitive builds its payload by passing optional caller fields straight
+ * through, so an omitted field arrives as an explicit `undefined` key. That key
+ * is real to Object.keys at signing time but disappears the moment the envelope
+ * is JSON-serialized to an HTTP client. The verifier would then recompute
+ * payload_root over a smaller key set and report payload_root_mismatch on a
+ * receipt that was never tampered with. Pruning here makes the signed payload
+ * byte-identical to the payload that travels, so signing and verifying agree
+ * across the wire.
+ */
+export function pruneUndefined(value) {
+  if (Array.isArray(value)) return value.map(pruneUndefined);
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      if (value[k] === undefined) continue;
+      out[k] = pruneUndefined(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
 /** Compute a Merkle root over a payload's canonical field-value leaves. */
 export function payloadRoot(payload, suite) {
   const s = suite || resolveSuite('sha-256');
-  const keys = Object.keys(payload || {}).sort();
+  const src = payload || {};
+  const keys = Object.keys(src).filter(k => src[k] !== undefined).sort();
   if (!keys.length) return '0'.repeat(s.digest_len * 2);
   const leaves = keys.map(k =>
-    hashHex(canonicalize({ k, v: payload[k] }), s));
+    hashHex(canonicalize({ k, v: src[k] }), s));
   return merkleRoot(leaves, s);
 }
 
@@ -108,6 +134,9 @@ export function signUpstreamReceipt(receipt_type, payload, meta, signer, opts = 
   const ttl = Number.isFinite(meta.ttl_seconds)
     ? meta.ttl_seconds
     : (DEFAULT_TTL[receipt_type] || 300);
+
+  // Sign exactly what will travel. See pruneUndefined above.
+  payload = pruneUndefined(payload);
 
   const env = {
     version:       USAP_VERSION,
